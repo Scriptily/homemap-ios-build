@@ -1,0 +1,140 @@
+name: iOS build
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      promax:
+        description: "Also check every screen on the Pro Max (adds ~8 min)"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: xcode-27      # GitHub's Xcode 27 image (iOS 27 SDK + simulators)
+    timeout-minutes: 60    # each step has its own limit, so a stuck simulator can't use up the whole hour
+    env:
+      # the screen tour runs on the iPhone NN Pro (the phone the app is used on); the Pro Max only when asked
+      PROMAX: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Xcode 27 (iOS 27 SDK)
+        run: |
+          ls -d /Applications/Xcode*.app
+          X=$(ls -d /Applications/Xcode_27*.app /Applications/Xcode.app 2>/dev/null | grep -m1 -E "Xcode_27|Xcode.app")
+          if [ -z "$X" ]; then echo "::error::no Xcode 27 on this runner image"; exit 1; fi
+          sudo xcode-select -s "$X"
+          xcodebuild -version; xcodebuild -version | grep -q "Xcode 27" || { echo "::error::not Xcode 27"; exit 1; }
+          xcrun simctl list runtimes | grep -i ios
+          brew install xcodegen
+      - name: Generate project
+        working-directory: ios
+        run: xcodegen generate
+      - name: Pick simulators
+        run: |
+          # the newest iOS runtime + fresh simulators of its newest "iPhone NN Pro" and "Pro Max" (the preinstalled set
+          # can be anything - a foldable letterboxes a portrait-only app)
+          xcrun simctl list devicetypes -j > types.json
+          xcrun simctl list runtimes -j > rts.json
+          python3 - <<'EOF' >> "$GITHUB_ENV"
+          import json, re, subprocess, sys
+          types = {t['name']: t['identifier'] for t in json.load(open('types.json'))['devicetypes']}
+          rts = [r for r in json.load(open('rts.json'))['runtimes'] if r.get('platform') == 'iOS' and r.get('isAvailable')]
+          print('iPhone types:', sorted(n for n in types if n.startswith('iPhone')), file=sys.stderr)
+          def newest(pat, ok):
+              c = [n for n in types if re.fullmatch(pat, n) and types[n] in ok]
+              return sorted(c, key=lambda n: int(re.findall(r'\d+', n)[0]))[-1] if c else None
+          # the newest iOS 27+ runtime that runs an "iPhone NN Pro" (a preview runtime may only list a new model)
+          ver = lambda r: [int(n) for n in re.findall(r'\d+', r['version'])]
+          rt, ok = None, set()
+          for r in sorted(rts, key=ver, reverse=True):
+              s = {d['identifier'] for d in r.get('supportedDeviceTypes', [])}
+              print(r['version'], sorted(n for n in types if types[n] in s and n.startswith('iPhone')), file=sys.stderr)
+              if ver(r)[0] >= 27 and newest(r'iPhone \d+ Pro', s): rt, ok = r, s; break
+          if not rt: rt, ok = sorted(rts, key=ver)[-1], set(types.values())   # try anyway
+          for label, name in (('PRO', newest(r'iPhone \d+ Pro', ok)), ('MAX', newest(r'iPhone \d+ Pro Max', ok) or newest(r'iPhone \d+ Pro', ok))):
+              udid = subprocess.check_output(['xcrun', 'simctl', 'create', 'HM ' + name, types[name], rt['identifier']]).decode().strip()
+              print(f"SIM_{label}={udid}"); print(f"SIM_{label}_NAME={name}")
+          print(f"RUNTIME={rt['identifier']}")
+          EOF
+          cat "$GITHUB_ENV" | grep -E "SIM_|RUNTIME"
+      - name: Build for testing (simulators boot meanwhile)
+        working-directory: ios
+        timeout-minutes: 20
+        run: |
+          # a cold simulator can time out the UI test runner ("AX loaded notification"): start both now - they boot while
+          # the app compiles, once, for every test run below
+          sims="$SIM_PRO"; [ "$PROMAX" = true ] && sims="$sims $SIM_MAX"
+          for id in $sims; do xcrun simctl boot "$id" || true; done
+          set -o pipefail
+          xcodebuild build-for-testing -project HomeMap.xcodeproj -scheme HomeMap -destination "id=$SIM_PRO" \
+            -derivedDataPath "$PWD/dd" CODE_SIGNING_ALLOWED=NO 2>&1 | tee bft.log | grep -E "error:|warning: .*deprecated|BUILD (SUCCEEDED|FAILED)"
+          for id in $sims; do xcrun simctl bootstatus "$id" -b; done
+      - name: Unit tests (simulator)
+        working-directory: ios
+        timeout-minutes: 10
+        run: |
+          set -o pipefail
+          xcodebuild test-without-building -project HomeMap.xcodeproj -scheme HomeMap -destination "id=$SIM_PRO" -only-testing:HomeMapTests \
+            -derivedDataPath "$PWD/dd" CODE_SIGNING_ALLOWED=NO 2>&1 | tee test.log | grep -E "Test Case .*(passed|failed)|error:|Executed|TEST (EXECUTE )?(SUCCEEDED|FAILED)"
+      - name: Every screen (screenshots + overlap check)
+        working-directory: ios
+        timeout-minutes: 30
+        run: |
+          mkdir -p shots
+          pairs="$SIM_PRO|pro"; [ "$PROMAX" = true ] && pairs="$pairs $SIM_MAX|promax"
+          for pair in $pairs; do
+            id="${pair%%|*}"; dev="${pair##*|}"
+            for try in 1 2; do
+              ok=1; rc=0
+              # at most 12 minutes a try (a full tour is ~7; macOS has no `timeout`: perl's alarm ends a stuck run)
+              TEST_RUNNER_SHOT_DIR="$PWD/shots" TEST_RUNNER_DEV="$dev" perl -e 'alarm shift; exec @ARGV' 720 \
+                xcodebuild test-without-building -project HomeMap.xcodeproj -scheme HomeMap -derivedDataPath "$PWD/dd" \
+                -destination "id=$id" -only-testing:HomeMapUITests CODE_SIGNING_ALLOWED=NO > "ui-$dev.log" 2>&1 || { rc=$?; ok=0; }
+              grep -E "Test Case .*(passed|failed)|error:|XCTAssert|failed -|TEST (SUCCEEDED|FAILED)" "ui-$dev.log" || true
+              [ "$ok" = 1 ] && break
+              # only the simulator failing to start or hanging (stopped by the alarm: 128 + 14) is retried; a failed check
+              # fails the build
+              [ "$rc" = 142 ] || grep -qE "failed to initialize for UI testing|Timed out waiting for AX" "ui-$dev.log" || { tail -30 "ui-$dev.log"; exit 1; }
+              echo "the simulator didn't start or got stuck (exit $rc) - once more"
+              xcrun simctl shutdown "$id" || true; xcrun simctl boot "$id"; xcrun simctl bootstatus "$id" -b
+            done
+            [ "$ok" = 1 ] || exit 1
+          done
+          ls shots | head -50
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screens
+          path: ios/shots
+          retention-days: 7
+      - name: Build (unsigned)
+        working-directory: ios
+        timeout-minutes: 15
+        run: |
+          set -o pipefail
+          xcodebuild -project HomeMap.xcodeproj -scheme HomeMap -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            SYMROOT="$PWD/build" build 2>&1 | tee build.log | grep -E "error:|warning: .*(deprecated|unavailable)|BUILD (SUCCEEDED|FAILED)" || true
+          test -d build/Release-iphoneos/HomeMap.app
+      - name: Package .ipa
+        working-directory: ios
+        run: |
+          mkdir -p Payload && cp -R build/Release-iphoneos/HomeMap.app Payload/
+          zip -qry HomeMap.ipa Payload
+          ls -la HomeMap.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HomeMap-ipa
+          path: ios/HomeMap.ipa
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: failure() || cancelled()
+        with:
+          name: build-log
+          path: |
+            ios/build.log
+            ios/bft.log
+            ios/test.log
+            ios/ui-*.log

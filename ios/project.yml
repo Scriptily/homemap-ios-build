@@ -1,0 +1,66 @@
+name: HomeMap
+options:
+  bundleIdPrefix: local.homemap
+  deploymentTarget:
+    iOS: "27.0"
+targets:
+  HomeMap:
+    type: application
+    platform: iOS
+    sources: [HomeMap]
+    info:
+      path: HomeMap/Info.plist
+      properties:
+        CFBundleDisplayName: Home Map
+        CFBundleShortVersionString: "1.8"
+        CFBundleVersion: "9"
+        UILaunchScreen: {}
+        UIRequiredDeviceCapabilities: [arkit]
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        NSCameraUsageDescription: The camera and LiDAR scan your rooms, and read the pairing QR code from Home Assistant.
+        NSLocalNetworkUsageDescription: Home Map sends your scans to Home Assistant on your home network.
+        UIStatusBarStyle: UIStatusBarStyleLightContent
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.homemap.scanner
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGN_IDENTITY: ""
+        ENABLE_BITCODE: "NO"
+    scheme:
+      testTargets: [HomeMapTests, HomeMapUITests]
+  HomeMapTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [HomeMapTests]
+    dependencies:
+      - target: HomeMap
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: "YES"
+        PRODUCT_BUNDLE_IDENTIFIER: local.homemap.scanner.tests
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGN_IDENTITY: ""
+  HomeMapUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [HomeMapUITests]
+    dependencies:
+      - target: HomeMap
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: "YES"
+        PRODUCT_BUNDLE_IDENTIFIER: local.homemap.scanner.uitests
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGN_IDENTITY: ""
